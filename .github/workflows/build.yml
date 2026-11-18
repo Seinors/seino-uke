@@ -1,0 +1,124 @@
+name: mozzrath-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      perf:
+        description: "Enable performance options (O3 + BBR)"
+        type: boolean
+        default: false
+      localversion:
+        description: "Kernel local version string"
+        type: string
+        default: "-mozzrath"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/lib/node_modules /opt/az /usr/lib/jvm
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 rsync zip unzip \
+            cpio xz-utils zstd lz4 device-tree-compiler build-essential
+
+      - name: Fetch AOSP clang
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/toolchain"
+          ok=0
+          for spec in "main-kernel-build-2024 clang-r510928" "main-kernel-2025 clang-r547379"; do
+            set -- $spec
+            branch="$1"; ver="$2"
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${branch}/${ver}.tar.gz"
+            echo "trying ${url}"
+            if curl -fsSL --retry 3 "$url" -o /tmp/clang.tar.gz \
+               && tar -xzf /tmp/clang.tar.gz -C "$HOME/toolchain"; then
+              echo "clang=${ver}" >> "$GITHUB_ENV"
+              ok=1
+              break
+            fi
+          done
+          test "$ok" = "1"
+          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+          "$HOME/toolchain/bin/clang" --version | head -1
+
+      - name: Fetch kernel source
+        run: |
+          set -euo pipefail
+          git clone --depth=1 -b sixteen \
+            https://github.com/Xiaomi-Pad-7-Development/android_kernel_xiaomi_sm8635.git kernel
+          cd kernel
+          git log -1 --oneline
+
+      - name: Configure kernel
+        env:
+          LOCALVERSION: ${{ inputs.localversion }}
+          PERF: ${{ inputs.perf }}
+        run: |
+          set -euo pipefail
+          cp configs/uke_gki_defconfig kernel/arch/arm64/configs/uke_gki_defconfig
+          cd kernel
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 uke_gki_defconfig
+          CFG=out/.config
+          sc() { ./scripts/config --file "$CFG" "$@"; }
+          sc -d TRIM_UNUSED_KSYMS
+          sc -e DEBUG_INFO_NONE
+          for s in DEBUG_INFO DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES DEBUG_INFO_DWARF4 GDB_SCRIPTS; do
+            sc -d "$s"
+          done
+          sc -d LOCALVERSION_AUTO
+          sc --set-str LOCALVERSION "$LOCALVERSION"
+          if [ "$PERF" = "true" ]; then
+            sc -e CC_OPTIMIZE_FOR_PERFORMANCE_O3
+            sc -d CC_OPTIMIZE_FOR_PERFORMANCE
+            sc -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -e DEFAULT_BBR
+            sc -d QTI_PMIC_GLINK_CLIENT_DEBUG -d PM_ADVANCED_DEBUG -d CIFS_DEBUG
+          fi
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          echo "--- relevant config ---"
+          grep -E 'CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|TRIM_UNUSED_KSYMS|MODVERSIONS|MODULE_SIG|DEBUG_INFO|CC_OPTIMIZE|LTO_|TCP_CONG|DEFAULT_BBR)' out/.config | sort || true
+
+      - name: Build Image
+        run: |
+          set -euo pipefail
+          cd kernel
+          time make -j"$(nproc)" O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          cd kernel
+          IMG=out/arch/arm64/boot/Image
+          test -f "$IMG"
+          file "$IMG"
+          xxd -l 64 "$IMG"
+          sha256sum "$IMG"
+          grep UTS_RELEASE out/include/generated/utsrelease.h || true
+          mkdir -p ../artifact
+          cp "$IMG" ../artifact/mozzrath-Image
+          cp out/.config ../artifact/mozzrath.config
+          cp out/System.map ../artifact/mozzrath.System.map
+          cp out/include/generated/utsrelease.h ../artifact/utsrelease.h 2>/dev/null || true
+          ls -l ../artifact
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mozzrath-${{ inputs.perf && 'perf' || 'base' }}
+          path: artifact/
+          if-no-files-found: error
